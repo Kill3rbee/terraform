@@ -183,6 +183,12 @@ func (s *GRPCProviderServer) PrepareProviderConfig(_ context.Context, req *proto
 		return resp, nil
 	}
 
+	// Ensure there are no nulls that will cause helper/schema to panic.
+	if err := validateConfigNulls(configVal); err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
 	config := terraform.NewResourceConfigShimmed(configVal, blockForShimming)
 	schema.FixupAsSingleResourceConfigIn(config, s.provider.Schema)
 
@@ -229,6 +235,12 @@ func (s *GRPCProviderServer) ValidateDataSourceConfig(_ context.Context, req *pr
 
 	configVal, err := msgpack.Unmarshal(req.Config.Msgpack, blockForCore.ImpliedType())
 	if err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
+	// Ensure there are no nulls that will cause helper/schema to panic.
+	if err := validateConfigNulls(configVal); err != nil {
 		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
 		return resp, nil
 	}
@@ -424,6 +436,12 @@ func (s *GRPCProviderServer) Configure(_ context.Context, req *proto.Configure_R
 
 	s.provider.TerraformVersion = req.TerraformVersion
 
+	// Ensure there are no nulls that will cause helper/schema to panic.
+	if err := validateConfigNulls(configVal); err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
 	config := terraform.NewResourceConfigShimmed(configVal, blockForShimming)
 	schema.FixupAsSingleResourceConfigIn(config, s.provider.Schema)
 	err = s.provider.Configure(config)
@@ -552,6 +570,12 @@ func (s *GRPCProviderServer) PlanResourceChange(_ context.Context, req *proto.Pl
 	}
 
 	priorState.Meta = priorPrivate
+
+	// Ensure there are no nulls that will cause helper/schema to panic.
+	if err := validateConfigNulls(proposedNewStateVal); err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
 
 	// turn the proposed state into a legacy configuration
 	cfg := terraform.NewResourceConfigShimmed(proposedNewStateVal, blockForShimming)
@@ -978,6 +1002,12 @@ func (s *GRPCProviderServer) ReadDataSource(_ context.Context, req *proto.ReadDa
 		Type: req.TypeName,
 	}
 
+	// Ensure there are no nulls that will cause helper/schema to panic.
+	if err := validateConfigNulls(configVal); err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
 	config := terraform.NewResourceConfigShimmed(configVal, blockForShimming)
 	schema.FixupAsSingleResourceConfigIn(config, s.provider.DataSourcesMap[req.TypeName].Schema)
 
@@ -1290,4 +1320,53 @@ func normalizeNullValues(dst, src cty.Value, preferDst bool) cty.Value {
 	}
 
 	return dst
+}
+
+var unexpectedNullErr = errors.New("list cannot contain null values")
+
+// validateConfigNulls checks a config value for unsupported nulls before
+// attempting to shim the value. While null values can mostly be ignored in the
+// configuration, since they're not supported in HCL1, the case where a null
+// appears in a list-like attribute (list, set, tuple) will present a nil value
+// to helper/schema which can panic. Return an error to the user in this case,
+// indicating the attribute with the null value.
+func validateConfigNulls(v cty.Value) error {
+	if v.IsNull() || !v.IsKnown() {
+		return nil
+	}
+
+	switch {
+	case v.Type().IsListType() || v.Type().IsSetType() || v.Type().IsTupleType():
+		it := v.ElementIterator()
+		for it.Next() {
+			_, ev := it.Element()
+
+			if ev.IsNull() {
+				return unexpectedNullErr
+			}
+
+			err := validateConfigNulls(ev)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case v.Type().IsMapType() || v.Type().IsObjectType():
+		it := v.ElementIterator()
+		for it.Next() {
+			kv, ev := it.Element()
+			err := validateConfigNulls(ev)
+			if err != nil {
+				// each level prepends the key name. This isn't ideal, but we
+				// don't have the information here for proper source
+				// diagnostics, and it should be a fairly rare occurrence.
+				err = fmt.Errorf("%s: %s", kv.AsString(), err.Error())
+				return err
+			}
+		}
+		return nil
+	}
+
+	return nil
 }
